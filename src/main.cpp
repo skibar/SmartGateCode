@@ -54,6 +54,7 @@ const byte CMD_WRITE_BLOCK = 0xA1;      // Kommando för att skriva ett block
 const byte STATUS_OK = 0x00;            // Statuskod för lyckad operation
 const byte STATUS_CARD_DETECTED = 0x01; // Statuskod för kort detekterat
 
+// Allt detta finns nu i en include --------------------------------------
 // #define PIN_RELAY_RED 26   // till röda reläet
 // #define PIN_RELAY_GREEN 27 // till gröna reläet
 // #define PIN_LED_GREEN 14   // Grön system/heartbeat-LED
