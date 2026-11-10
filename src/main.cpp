@@ -1,6 +1,6 @@
 /*
    SKIBAR RFID GATE – Smartgate - SLUTGILTIG VERSION 2026
-   Kundversion: 127 – lokal utveckling med räknare för passager
+   Kundversion: 129 – lokal utveckling med räknare för passager
    RÄTT TIDSFIX enligt Stefan
    100 % kompilerbar – testad och klar
 
@@ -30,6 +30,7 @@
 #include "time.h"
 #include "SkibarTypes.h"
 #include "secrets.h"
+#include "BoardConfig.h"
 
 #ifndef F
 #define F(s) ((const __FlashStringHelper *)(s))
@@ -40,9 +41,9 @@
 #define MFRC522_ADDR 0x28
 
 // sätt detta när en ny installation ska göras
-const int programVersion = 127;
+const int programVersion = 129;
 long portSiteId = 1;
-long gateId = 103;
+long gateId = 100; // Default värde
 int configVersion = 0;
 
 const byte CMD_WAKEUP = 0x00;           // Kommando för att aktivera LPCD (lågpower card detection)
@@ -53,12 +54,12 @@ const byte CMD_WRITE_BLOCK = 0xA1;      // Kommando för att skriva ett block
 const byte STATUS_OK = 0x00;            // Statuskod för lyckad operation
 const byte STATUS_CARD_DETECTED = 0x01; // Statuskod för kort detekterat
 
-#define PIN_RELAY_RED 26   // till röda reläet
-#define PIN_RELAY_GREEN 27 // till gröna reläet
-#define PIN_LED_GREEN 14   // Grön system/heartbeat-LED
-#define PIN_LED_BLUE 25    // Blå kommunikations-LED
-#define PIN_BUZZER 32      // Summer via NPN-transistor
-#define PIN_IR_BARRIER 33  // E3JK-R4M1 signal, INPUT_PULLUP
+// #define PIN_RELAY_RED 26   // till röda reläet
+// #define PIN_RELAY_GREEN 27 // till gröna reläet
+// #define PIN_LED_GREEN 14   // Grön system/heartbeat-LED
+// #define PIN_LED_BLUE 25    // Blå kommunikations-LED
+// #define PIN_BUZZER 32      // Summer via NPN-transistor
+// #define PIN_IR_BARRIER 33  // E3JK-R4M1 signal, INPUT_PULLUP
 
 // ------------------------------------------------------------
 // IR / passage settings
@@ -79,6 +80,35 @@ unsigned long irStateChangedAt = 0;
 GateState gateState = GATE_IDLE;
 unsigned long gateStateSince = 0;
 unsigned long redHoldUntil = 0;
+
+//----------------------------------
+extern WiFiClient tcpClient;
+extern bool tcpAuthenticated;
+class TeePrint : public Print
+{
+public:
+  size_t write(uint8_t value) override
+  {
+    Serial.write(value);
+
+    if (tcpAuthenticated && tcpClient.connected())
+      tcpClient.write(value);
+
+    return 1;
+  }
+
+  size_t write(const uint8_t *buffer, size_t size) override
+  {
+    Serial.write(buffer, size);
+
+    if (tcpAuthenticated && tcpClient.connected())
+      tcpClient.write(buffer, size);
+
+    return size;
+  }
+};
+
+extern TeePrint logOutput;
 
 // ------------------------------------------------------------
 // Funktionsdeklarationer för PlatformIO
@@ -107,6 +137,11 @@ bool writeCardNow(const String &input);
 void eraseCard();
 
 bool receiveLocalOta(size_t imageSize, const String &md5);
+void logPrint(const String &message);
+void logPrintln(const String &message);
+void startDiscoveryUdp();   // för att enheten ska gå att hitta
+void processDiscoveryUdp(); // för att enheten ska gå att hitta
+TeePrint logOutput;
 // ------------------------------------------------------------
 
 const char *gateStateName(GateState state)
@@ -132,14 +167,14 @@ const char *gateStateName(GateState state)
 
 void printGateStateDefinitions()
 {
-  Serial.println(F("GateState enum:"));
-  Serial.println(F("  0 = GATE_IDLE"));
-  Serial.println(F("  1 = GATE_GREEN_AUTHORIZED"));
-  Serial.println(F("  2 = GATE_GREEN_PASSING"));
-  Serial.println(F("  3 = GATE_RED_ACTIVE"));
-  Serial.println(F("  4 = GATE_RED_PASSING"));
-  Serial.println(F("  5 = GATE_REARM_DELAY"));
-  Serial.println();
+  logOutput.println(F("GateState enum:"));
+  logOutput.println(F("  0 = GATE_IDLE"));
+  logOutput.println(F("  1 = GATE_GREEN_AUTHORIZED"));
+  logOutput.println(F("  2 = GATE_GREEN_PASSING"));
+  logOutput.println(F("  3 = GATE_RED_ACTIVE"));
+  logOutput.println(F("  4 = GATE_RED_PASSING"));
+  logOutput.println(F("  5 = GATE_REARM_DELAY"));
+  logOutput.println();
 }
 
 void setGateState(GateState newState, const char *reason = nullptr)
@@ -151,7 +186,7 @@ void setGateState(GateState newState, const char *reason = nullptr)
   gateState = newState;
   gateStateSince = millis();
 
-  Serial.printf(
+  logOutput.printf(
       "GateState: %s (%d) -> %s (%d) | IR: %s",
       gateStateName(oldState), (int)oldState,
       gateStateName(newState), (int)newState,
@@ -159,9 +194,9 @@ void setGateState(GateState newState, const char *reason = nullptr)
 
   if (reason && reason[0] != '\0')
   {
-    Serial.printf(" | Orsak: %s", reason);
+    logOutput.printf(" | Orsak: %s", reason);
   }
-  Serial.println();
+  logOutput.println();
 }
 
 const String FIRMWARE_VERSION_URL = "https://server.skibar.se/stage/firmware/version.html";
@@ -184,6 +219,7 @@ String tcpInputBuffer;
 bool tcpAuthenticated = false;
 // Hemlighet får att använda TCP
 // const char* TCP_ADMIN_TOKEN = "Kopp!auppmedSesamOppnaD1g";
+
 // ------------------------------------------------------------
 
 String IP = "";
@@ -191,6 +227,10 @@ String wifidB = "";
 
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "se.pool.ntp.org", 0, 60000);
+
+// UDP discovery för SmartGate Admin
+WiFiUDP discoveryUdp;
+const uint16_t DISCOVERY_PORT = 4243;
 
 MFRC522_I2C mfrc522(MFRC522_ADDR, -1);
 MFRC522_I2C::MIFARE_Key key;
@@ -211,21 +251,25 @@ void countGreenPassage()
 {
   greenPassageCount++;
   prefs.putULong("greenCount", greenPassageCount);
-  Serial.printf("GRÖN passage registrerad. Totalt gröna: %lu\n", (unsigned long)greenPassageCount);
+
+  logPrintln("GRÖN passage registrerad. Totalt gröna: " +
+             String(greenPassageCount));
 }
 
 void countRedPassage()
 {
   redPassageCount++;
   prefs.putULong("redCount", redPassageCount);
-  Serial.printf("RÖD passage registrerad. Totalt röda: %lu\n", (unsigned long)redPassageCount);
+
+  logPrintln("RÖD passage registrerad. Totalt röda: " +
+             String(redPassageCount));
 }
 
 void printPassageCounts()
 {
-  Serial.println(F("\n=== Passageräknare ==="));
-  Serial.printf("GreenPassages: %lu\n", (unsigned long)greenPassageCount);
-  Serial.printf("RedPassages  : %lu\n", (unsigned long)redPassageCount);
+  logOutput.println(F("\n=== Passageräknare ==="));
+  logOutput.printf("GreenPassages: %lu\n", (unsigned long)greenPassageCount);
+  logOutput.printf("RedPassages  : %lu\n", (unsigned long)redPassageCount);
 }
 
 time_t currentTime = 0;
@@ -411,12 +455,12 @@ bool loadGateConfigFromServer()
   if (WiFi.status() != WL_CONNECTED)
   {
     serverContactOk = false;
-    Serial.println(F("Config: Ingen WiFi – använder lokal config."));
+    logOutput.println(F("Config: Ingen WiFi – använder lokal config."));
     return false;
   }
 
   String gateUrl = GATE_CONFIG_BASE_URL + String(gateId) + "/config.json";
-  Serial.printf("Config: hämtar %s\n", gateUrl.c_str());
+  logOutput.printf("Config: hämtar %s\n", gateUrl.c_str());
 
   HTTPClient http;
   http.setTimeout(5000);
@@ -434,7 +478,7 @@ bool loadGateConfigFromServer()
 
   if (httpCode != HTTP_CODE_OK)
   {
-    Serial.printf("Config: HTTP-fel %d – behåller lokal config.\n", httpCode);
+    logOutput.printf("Config: HTTP-fel %d – behåller lokal config.\n", httpCode);
     http.end();
     return false;
   }
@@ -445,14 +489,14 @@ bool loadGateConfigFromServer()
   json.trim();
   if (json.length() < 2 || json[0] != '{')
   {
-    Serial.println(F("Config: Ogiltigt JSON-svar – behåller lokal config."));
+    logOutput.println(F("Config: Ogiltigt JSON-svar – behåller lokal config."));
     return false;
   }
 
   long responseGateId = jsonGetLong(json, "gateId", gateId);
   if (responseGateId != gateId)
   {
-    Serial.printf("Config: FEL gateId i svar (%ld), förväntade %ld.\n", responseGateId, gateId);
+    logOutput.printf("Config: FEL gateId i svar (%ld), förväntade %ld.\n", responseGateId, gateId);
     return false;
   }
 
@@ -468,7 +512,7 @@ bool loadGateConfigFromServer()
   cfg.irRearmDelay = jsonGetULong(json, "irRearmDelay", IR_REARM_DELAY_MS);
   cfg.configVersion = jsonGetInt(json, "configVersion", configVersion);
 
-  Serial.printf(
+  logOutput.printf(
       "Config: Gate=%ld, Site=%ld, IR=%s, Relay=%lums, Auth=%lums, Red=%lums, Post=%lums, Rearm=%lums, Version=%d\n",
       cfg.gateId, cfg.siteId, cfg.irExists ? "JA" : "NEJ",
       cfg.relayOnDuration, cfg.rfidAuthTimeout, cfg.invalidCardRedDuration,
@@ -477,24 +521,123 @@ bool loadGateConfigFromServer()
   // Samma version innebär att serverkonfigurationen inte har ändrats.
   if (cfg.configVersion == configVersion)
   {
-    Serial.printf("Config version %d oförändrad - behåller lokal config.\n", configVersion);
+    logOutput.printf("Config version %d oförändrad - behåller lokal config.\n", configVersion);
     return true;
   }
   else
   {
-    Serial.println(F("Config: sparad i Preferences och aktiv."));
-    Serial.println("");
+    logOutput.println(F("Config: sparad i Preferences och aktiv."));
+    logOutput.println("");
   }
 
   signalBlueEvent(2);
   return true;
 }
 
+// ------------------------------------------------------------
+// UDP Discovery – hitta SmartGate i det lokala nätverket
+// ------------------------------------------------------------
+
+void startDiscoveryUdp()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    logOutput.println("UDP Discovery: WiFi ej anslutet.");
+    return;
+  }
+
+  discoveryUdp.stop();
+
+  if (discoveryUdp.begin(DISCOVERY_PORT))
+  {
+    logOutput.printf(
+        "UDP Discovery startad på port %u, IP %s\n",
+        DISCOVERY_PORT,
+        WiFi.localIP().toString().c_str());
+  }
+  else
+  {
+    logOutput.println("Kunde inte starta UDP Discovery!");
+  }
+}
+
+void processDiscoveryUdp()
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return;
+
+  while (true)
+  {
+    int packetSize = discoveryUdp.parsePacket();
+
+    if (packetSize > 0)
+    {
+      logOutput.printf(
+          "UDP Discovery: paket mottaget från %s:%u, storlek %d\n",
+          discoveryUdp.remoteIP().toString().c_str(), discoveryUdp.remotePort(), packetSize);
+    }
+
+    if (packetSize <= 0)
+      break;
+
+    char request[128];
+
+    int len = discoveryUdp.read(
+        request,
+        sizeof(request) - 1);
+
+    if (len <= 0)
+      continue;
+
+    request[len] = '\0';
+
+    String command = String(request);
+    command.trim();
+
+    if (command != "SMARTGATE_DISCOVER_V1")
+      continue;
+
+    String response =
+        "SMARTGATE;1;" +
+        String(gateId) + ";" +
+        String(portSiteId) + ";" +
+        WiFi.localIP().toString() + ";" +
+        "4242;" +
+        String(programVersion);
+
+    IPAddress remoteIP = discoveryUdp.remoteIP();
+    uint16_t remotePort = discoveryUdp.remotePort();
+
+    if (discoveryUdp.beginPacket(remoteIP, remotePort))
+    {
+      discoveryUdp.print(response);
+
+      if (discoveryUdp.endPacket())
+      {
+        logOutput.printf(
+            "UDP Discovery: svar skickat till %s:%u\n",
+            remoteIP.toString().c_str(),
+            remotePort);
+      }
+      else
+      {
+        logOutput.println(
+            "UDP Discovery: kunde inte skicka svar!");
+      }
+    }
+    else
+    {
+      logOutput.println(
+          "UDP Discovery: beginPacket misslyckades!");
+    }
+  }
+}
+
 void setup()
 {
   Serial.begin(115200);
   delay(2000);
-  Serial.println(F("\n=== Skibar RFID Gate v2.1 startar ==="));
+  logOutput.println(F("\n=== Skibar RFID Gate v2.1 startar ==="));
 
   for (byte i = 0; i < 6; i++)
     key.keyByte[i] = 0xFF;
@@ -505,11 +648,14 @@ void setup()
   delay(4);
 
   byte ver = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
-  Serial.printf("MFRC522 version: 0x%02X\n", ver);
+  logOutput.printf("MFRC522 version: 0x%02X\n", ver);
   if (ver == 0x00 || ver == 0xFF)
   {
-    Serial.println(F("FEL: Ingen RFID-läsare! Kolla kablar."));
-    startupGreenErrorBlink();
+    logOutput.println(F("VARNING: Ingen RFID-läsare! Fortsätter utan RFID."));
+  }
+  else
+  {
+    logOutput.println(F("RFID-läsare hittad."));
   }
 
   pinMode(PIN_RELAY_RED, OUTPUT);
@@ -524,7 +670,7 @@ void setup()
   irBlocked = irRawState;
   irStateChangedAt = millis();
   gateStateSince = millis();
-  Serial.printf("IR-barriär startläge: %s\n", irBlocked ? "BRUTEN" : "FRI");
+  logOutput.printf("IR-barriär startläge: %s\n", irBlocked ? "BRUTEN" : "FRI");
 
   digitalWrite(PIN_RELAY_RED, HIGH);
   digitalWrite(PIN_RELAY_GREEN, HIGH);
@@ -534,8 +680,8 @@ void setup()
   prefs.begin("skibar", false);
   greenPassageCount = prefs.getULong("greenCount", 0);
   redPassageCount = prefs.getULong("redCount", 0);
-  Serial.printf("Passageräknare laddade: gröna=%lu, röda=%lu\n",
-                (unsigned long)greenPassageCount, (unsigned long)redPassageCount);
+  logOutput.printf("Passageräknare laddade: gröna=%lu, röda=%lu\n",
+                   (unsigned long)greenPassageCount, (unsigned long)redPassageCount);
 
   // Ladda WiFi-creds först
   prefs.getString("ssid", wifiSsid, sizeof(wifiSsid));
@@ -558,8 +704,8 @@ void setup()
   IR_REARM_DELAY_MS = prefs.getULong("irRearmMs", 1000UL);
   UseIRGate = prefs.getBool("irExist", true);
   configVersion = prefs.getInt("configVersion", 0);
-  Serial.printf("Gate ID: %ld | Site ID: %ld | Config version: %d | IR gate: %s\n",
-                gateId, portSiteId, configVersion, UseIRGate ? "JA" : "NEJ");
+  logOutput.printf("Gate ID: %ld | Site ID: %ld | Config version: %d | IR gate: %s\n",
+                   gateId, portSiteId, configVersion, UseIRGate ? "JA" : "NEJ");
 
   // Anslut WiFi TIDIGT
   connectWiFi();
@@ -568,10 +714,10 @@ void setup()
   {
     tcpServer.begin();
     tcpServer.setNoDelay(true);
-
+    startDiscoveryUdp();
     wifiWasConnected = true;
 
-    Serial.printf("TCP-server startad på %s:4242\n", WiFi.localIP().toString().c_str());
+    logOutput.printf("TCP-server startad på %s:4242\n", WiFi.localIP().toString().c_str());
   }
 
   // Initiera NTPClient – fix för UDP-connection
@@ -595,7 +741,7 @@ void setup()
   {
     // Fallback: Ladda sista sparade tid om ingen WiFi
     currentTime = prefs.getLong("time", time(nullptr)); // Använd current system time som default om ingen sparad
-    Serial.printf("Ingen WiFi – använder sparad tid: %s", ctime(&currentTime));
+    logOutput.printf("Ingen WiFi – använder sparad tid: %s", ctime(&currentTime));
   }
 
   // Resten som innan...
@@ -622,37 +768,37 @@ void setup()
   printHelp();
 
   startupGreenReadyBlink();
-  Serial.println(F("Redo för kort!\n"));
+  logOutput.println(F("Redo för kort!\n"));
 }
 
 void syncTimeFromNtp()
 {
-  Serial.print(F("Synkar tid... "));
+  logOutput.print(F("Synkar tid... "));
 
   // Använd configTime:s inbyggda synk, vänta tills tid är satt
   unsigned long start = millis();
   while (time(nullptr) < 1000000000UL && millis() - start < 10000)
   { // Vänta upp till 10 sekunder
     delay(500);
-    Serial.print(".");
+    logOutput.print(".");
   }
 
   if (time(nullptr) < 1000000000UL)
   {
-    Serial.println(F(" misslyckades"));
+    logOutput.println(F(" misslyckades"));
     return;
   }
 
   currentTime = time(nullptr); // UTC epoch
   prefs.putLong("time", currentTime);
-  Serial.printf(" UTC: %s", ctime(&currentTime)); // Detta visar lokal tid pga TZ
+  logOutput.printf(" UTC: %s", ctime(&currentTime)); // Detta visar lokal tid pga TZ
 
   // För att visa lokal tid explicit
   struct tm local_tm;
   localtime_r(&currentTime, &local_tm);
   char buf[64];
   strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &local_tm);
-  Serial.printf(" Lokal: %s\n", buf);
+  logOutput.printf(" Lokal: %s\n", buf);
 }
 
 void updateLocalTime()
@@ -677,7 +823,7 @@ void updateLocalTime()
       localtime_r(&currentTime, &local_tm);
       char buf[64];
       strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &local_tm);
-      // Serial.printf("Uppdaterar tid lokalt: %s\n", buf);
+      // logOutput.printf("Uppdaterar tid lokalt: %s\n", buf);
     }
     lastMinuteUpdate = now;
   }
@@ -685,7 +831,7 @@ void updateLocalTime()
 
 void connectWiFi()
 {
-  Serial.printf("Ansluter till WiFi: %s...", wifiSsid);
+  logOutput.printf("Ansluter till WiFi: %s...", wifiSsid);
   externalStatus = EXTERNAL_CONNECTING;
   bool ledState = false;
 
@@ -696,23 +842,23 @@ void connectWiFi()
     ledState = !ledState;
     digitalWrite(PIN_LED_BLUE, ledState ? HIGH : LOW);
     delay(500);
-    Serial.print(".");
+    logOutput.print(".");
   }
 
   if (WiFi.status() == WL_CONNECTED)
   {
-    Serial.println(F(" OK!"));
+    logOutput.println(F(" OK!"));
     externalStatus = EXTERNAL_WIFI_ONLY;
     digitalWrite(PIN_LED_BLUE, LOW);
 
     String ipStr = WiFi.localIP().toString();
-    Serial.printf("IP: %s | Signal: %d dBm\n", ipStr.c_str(), WiFi.RSSI());
+    logOutput.printf("IP: %s | Signal: %d dBm\n", ipStr.c_str(), WiFi.RSSI());
     wifidB = String(WiFi.RSSI()) + "dBm";
     IP = ipStr;
   }
   else
   {
-    Serial.println(F(" misslyckades"));
+    logOutput.println(F(" misslyckades"));
     externalStatus = EXTERNAL_NO_WIFI;
     serverContactOk = false;
     digitalWrite(PIN_LED_BLUE, LOW);
@@ -731,13 +877,14 @@ void maintainWiFiConnection()
 
     if (wifiWasConnected)
     {
-      Serial.println();
-      Serial.println(F("WiFi-anslutningen har förlorats!"));
+      logOutput.println();
+      logOutput.println(F("WiFi-anslutningen har förlorats!"));
 
       wifiWasConnected = false;
 
       // Avsluta eventuell TCP-session
       tcpClient.stop();
+      discoveryUdp.stop();
       tcpAuthenticated = false;
       tcpInputBuffer = "";
 
@@ -755,7 +902,7 @@ void maintainWiFiConnection()
     {
       lastWifiReconnectAttempt = now;
 
-      Serial.println(F("Försöker återansluta till WiFi..."));
+      logOutput.println(F("Försöker återansluta till WiFi..."));
       WiFi.reconnect();
     }
 
@@ -769,14 +916,14 @@ void maintainWiFiConnection()
   {
     wifiWasConnected = true;
 
-    Serial.println();
-    Serial.println(F("WiFi-anslutningen är tillbaka!"));
+    logOutput.println();
+    logOutput.println(F("WiFi-anslutningen är tillbaka!"));
 
     IP = WiFi.localIP().toString();
     wifidB = String(WiFi.RSSI()) + "dBm";
 
-    Serial.printf("IP: %s | Signal: %d dBm\n",
-                  IP.c_str(), WiFi.RSSI());
+    logOutput.printf("IP: %s | Signal: %d dBm\n",
+                     IP.c_str(), WiFi.RSSI());
 
     externalStatus = EXTERNAL_WIFI_ONLY;
     serverContactOk = false;
@@ -784,19 +931,20 @@ void maintainWiFiConnection()
     // Starta TCP-servern igen
     tcpServer.begin();
     tcpServer.setNoDelay(true);
+    startDiscoveryUdp();
 
-    Serial.println(F("TCP-server startad på port 4242."));
+    logOutput.println(F("TCP-server startad på port 4242."));
 
     // Kontrollera kontakten med Skibar-servern igen
-    Serial.println(F("Kontrollerar kontakt med Skibar-servern..."));
+    logOutput.println(F("Kontrollerar kontakt med Skibar-servern..."));
 
     if (loadGateConfigFromServer())
     {
-      Serial.println(F("Serverkontakt återupprättad."));
+      logOutput.println(F("Serverkontakt återupprättad."));
     }
     else
     {
-      Serial.println(F("Serverkontakt saknas fortfarande."));
+      logOutput.println(F("Serverkontakt saknas fortfarande."));
     }
   }
 }
@@ -987,7 +1135,7 @@ void relayOn(uint8_t pin, const char *name, unsigned long &timer, bool &state)
   digitalWrite(pin, LOW);
   timer = millis();
   state = true;
-  Serial.printf("%s relä → PÅ\n", name);
+  logOutput.printf("%s relä → PÅ\n", name);
 }
 
 void relayOff(uint8_t pin, const char *name)
@@ -997,7 +1145,7 @@ void relayOff(uint8_t pin, const char *name)
     redRelayActive = false;
   if (pin == PIN_RELAY_GREEN)
     greenRelayActive = false;
-  Serial.printf("%s relä → AV\n", name);
+  logOutput.printf("%s relä → AV\n", name);
 }
 
 void authorizePassage()
@@ -1016,11 +1164,11 @@ void authorizePassage()
 
     if (irBlocked)
     {
-      Serial.println(F("RFID GODKÄNT och IR redan bruten → GRÖN passage"));
+      logOutput.println(F("RFID GODKÄNT och IR redan bruten → GRÖN passage"));
     }
     else
     {
-      Serial.println(F("RFID GODKÄNT → GRÖN tänd, väntar på IR-passage..."));
+      logOutput.println(F("RFID GODKÄNT → GRÖN tänd, väntar på IR-passage..."));
     }
   }
   else
@@ -1034,7 +1182,7 @@ void cancelPassageAuthorization(const char *reason)
 {
   if (passageAuthorized)
   {
-    Serial.printf("RFID-godkännande återställt: %s\n", reason);
+    logOutput.printf("RFID-godkännande återställt: %s\n", reason);
   }
   passageAuthorized = false;
   passageAuthorizedAt = 0;
@@ -1067,7 +1215,7 @@ void startRedForInvalidCard()
   setGateState(irBlocked ? GATE_RED_PASSING : GATE_RED_ACTIVE,
                irBlocked ? "Ogiltigt RFID + IR bruten" : "Ogiltigt RFID");
 
-  Serial.printf("OGILTIGT RFID → RÖD i minst %lu ms\n", INVALID_CARD_RED_DURATION);
+  logOutput.printf("OGILTIGT RFID → RÖD i minst %lu ms\n", INVALID_CARD_RED_DURATION);
 }
 
 void startRedForUnapprovedPassage()
@@ -1078,7 +1226,7 @@ void startRedForUnapprovedPassage()
   redHoldUntil = 0; // Sätts när strålen kommer tillbaka.
   setGateState(GATE_RED_PASSING, "IR-passage utan godkänt RFID");
 
-  Serial.println(F("IR-passage utan godkänt RFID → RÖD under hela passagen"));
+  logOutput.println(F("IR-passage utan godkänt RFID → RÖD under hela passagen"));
 }
 
 void handleIrPassage()
@@ -1108,14 +1256,14 @@ void handleIrPassage()
   case GATE_GREEN_AUTHORIZED:
     if (irBlocked)
     {
-      Serial.println(F("IR bruten efter godkänt RFID → GRÖN passage"));
+      logOutput.println(F("IR bruten efter godkänt RFID → GRÖN passage"));
       setGateState(GATE_GREEN_PASSING, "IR bruten efter godkänt RFID");
     }
     else if (passageAuthorized && now - passageAuthorizedAt >= RFID_AUTH_TIMEOUT)
     {
       cancelPassageAuthorization("timeout");
       setGateState(GATE_IDLE, "IR avstängd / reset");
-      Serial.println(F("RFID-godkännande timeout → GRÖN passage ej genomförd"));
+      logOutput.println(F("RFID-godkännande timeout → GRÖN passage ej genomförd"));
     }
     break;
 
@@ -1128,7 +1276,7 @@ void handleIrPassage()
 
     if (!irBlocked)
     {
-      Serial.println(F("Godkänd passage avslutad → GRÖN av, rearm 1 sekund"));
+      logOutput.println(F("Godkänd passage avslutad → GRÖN av, rearm 1 sekund"));
       countGreenPassage();
       relayOff(PIN_RELAY_GREEN, "Grönt");
       cancelPassageAuthorization("passage genomförd");
@@ -1141,7 +1289,7 @@ void handleIrPassage()
     // Om strålen bryts under tiden går vi över till RED_PASSING.
     if (irBlocked)
     {
-      Serial.println(F("IR bruten medan RÖD är aktiv → RÖD under hela passagen"));
+      logOutput.println(F("IR bruten medan RÖD är aktiv → RÖD under hela passagen"));
       setGateState(GATE_RED_PASSING, "IR bruten under röd aktiv");
     }
     else if (now >= redHoldUntil)
@@ -1164,7 +1312,7 @@ void handleIrPassage()
       countRedPassage();
       // Efter passage ska rött fortsätta minst 3 sekunder.
       redHoldUntil = max(redHoldUntil, now + RED_POST_PASSAGE_DURATION);
-      Serial.println(F("Röd passage avslutad → RÖD kvar 3 sekunder"));
+      logOutput.println(F("Röd passage avslutad → RÖD kvar 3 sekunder"));
       setGateState(GATE_RED_ACTIVE, "Obehörig passage avslutad, eftertid");
     }
     break;
@@ -1180,7 +1328,7 @@ void handleIrPassage()
     {
       setGateState(GATE_IDLE, "IR avstängd / reset");
       gateStateSince = now;
-      Serial.println(F("IR rearm klar → systemet redo för ny passage"));
+      logOutput.println(F("IR rearm klar → systemet redo för ny passage"));
     }
     break;
   }
@@ -1210,7 +1358,7 @@ bool authenticateCard()
 
   if (status != MFRC522_I2C::STATUS_OK)
   {
-    Serial.printf("Auth fel: %s\n", mfrc522.GetStatusCodeName(status));
+    logOutput.printf("Auth fel: %s\n", mfrc522.GetStatusCodeName(status));
     mfrc522.PICC_HaltA();
     mfrc522.PCD_StopCrypto1();
     return false;
@@ -1245,13 +1393,13 @@ bool readCardData(time_t &from, time_t &to, long &orderId, long &siteId, bool le
 
   if (!authenticateCard())
   {
-    Serial.println(F("❌ Autentisering misslyckades vid läsning"));
+    logOutput.println(F("❌ Autentisering misslyckades vid läsning"));
     return false;
   }
 
   if (mfrc522.MIFARE_Read(DATA_BLOCK, buffer, &len) != MFRC522_I2C::STATUS_OK)
   {
-    Serial.println(F("❌ Läsning misslyckades"));
+    logOutput.println(F("❌ Läsning misslyckades"));
     mfrc522.PICC_HaltA();
     mfrc522.PCD_StopCrypto1();
     return false;
@@ -1292,8 +1440,8 @@ bool readCardData(time_t &from, time_t &to, long &orderId, long &siteId, bool le
   from = mktime(&t1);
   to = mktime(&t2);
 
-  Serial.printf("Läser från kort: %04d-%02d-%02d %02d:%02d → %04d-%02d-%02d %02d:%02d | Order:%ld | Site:%ld\n",
-                y1, m1, d1, h1, min1, y2, m2, d2, h2, min2, orderId, siteId);
+  logOutput.printf("Läser från kort: %04d-%02d-%02d %02d:%02d → %04d-%02d-%02d %02d:%02d | Order:%ld | Site:%ld\n",
+                   y1, m1, d1, h1, min1, y2, m2, d2, h2, min2, orderId, siteId);
 
   if (!leaveCardActive)
   {
@@ -1346,7 +1494,7 @@ void writeCardData(const String &params)
 
   if (idx != 4)
   {
-    Serial.println(F("Fel format! Exempel: write 2026-04-20 00:00,2026-05-01 23:59,1234,1"));
+    logOutput.println(F("Fel format! Exempel: write 2026-04-20 00:00,2026-05-01 23:59,1234,1"));
     return;
   }
 
@@ -1366,8 +1514,8 @@ void writeCardData(const String &params)
   long orderId = parts[2].toInt();
   long siteId = 1; // parts[3].toInt();
 
-  Serial.printf("Sparar: %04d-%02d-%02d %02d:%02d → %04d-%02d-%02d %02d:%02d | Order:%ld | Site:%ld\n",
-                y1, m1, d1, h1, min1, y2, m2, d2, h2, min2, orderId, siteId);
+  logOutput.printf("Sparar: %04d-%02d-%02d %02d:%02d → %04d-%02d-%02d %02d:%02d | Order:%ld | Site:%ld\n",
+                   y1, m1, d1, h1, min1, y2, m2, d2, h2, min2, orderId, siteId);
 
   // === Packa till 16 bytes ===
   byte buf[16] = {0};
@@ -1396,7 +1544,7 @@ void writeCardData(const String &params)
 
   // Skriv till kort
   cardWriteMode = true;
-  Serial.println(F("Skanna kort för att skriva (10 sekunder)..."));
+  logOutput.println(F("Skanna kort för att skriva (10 sekunder)..."));
   unsigned long deadline = millis() + 10000;
 
   while (millis() < deadline)
@@ -1405,11 +1553,11 @@ void writeCardData(const String &params)
     {
       if (authenticateCard() && mfrc522.MIFARE_Write(DATA_BLOCK, buf, 16) == MFRC522_I2C::STATUS_OK)
       {
-        Serial.println(F("✅ Kortet är programmerat!"));
+        logOutput.println(F("✅ Kortet är programmerat!"));
       }
       else
       {
-        Serial.println(F("❌ Skrivning misslyckades"));
+        logOutput.println(F("❌ Skrivning misslyckades"));
       }
       mfrc522.PICC_HaltA();
       mfrc522.PCD_StopCrypto1();
@@ -1424,7 +1572,7 @@ bool queryServerAndOpenIfValid(const String &uid, bool canWriteNow = false, bool
 {
   if (WiFi.status() != WL_CONNECTED)
   {
-    Serial.println(F("Ingen WiFi → RFID kan inte verifieras mot servern"));
+    logOutput.println(F("Ingen WiFi → RFID kan inte verifieras mot servern"));
     return false;
   }
 
@@ -1450,7 +1598,7 @@ bool queryServerAndOpenIfValid(const String &uid, bool canWriteNow = false, bool
   int httpCode = http.POST(soap);
   if (httpCode != 200)
   {
-    Serial.printf("Serverfel (HTTP %d) – passage förblir ej godkänd\n", httpCode);
+    logOutput.printf("Serverfel (HTTP %d) – passage förblir ej godkänd\n", httpCode);
     http.end();
     return false;
   }
@@ -1462,12 +1610,12 @@ bool queryServerAndOpenIfValid(const String &uid, bool canWriteNow = false, bool
   int e = resp.indexOf("</CheckCardResult>");
   if (s == -1 || e == -1)
   {
-    Serial.println(F("Inget giltigt svar från servern – passage förblir ej godkänd"));
+    logOutput.println(F("Inget giltigt svar från servern – passage förblir ej godkänd"));
     return false;
   }
 
   String result = resp.substring(s + 17, e);
-  Serial.println("Server svarade: " + result);
+  logOutput.println("Server svarade: " + result);
 
   // Parsa resultatet
   int c1 = result.indexOf(',');
@@ -1486,7 +1634,7 @@ bool queryServerAndOpenIfValid(const String &uid, bool canWriteNow = false, bool
     {
       if (writeCardNow("write," + fromStr + "," + toStr + "," + orderIdStr + "," + siteIdStr))
       {
-        Serial.println(F("✅ Kort uppdaterat medan det låg kvar!"));
+        logOutput.println(F("✅ Kort uppdaterat medan det låg kvar!"));
       }
     }
 
@@ -1501,14 +1649,14 @@ bool queryServerAndOpenIfValid(const String &uid, bool canWriteNow = false, bool
     }
     else
     {
-      Serial.println(F("Servern godkände kortet (ingen passage startad)."));
+      logOutput.println(F("Servern godkände kortet (ingen passage startad)."));
     }
 
     return true;
   }
   else
   {
-    Serial.println(F("Servern godkände inte kortet."));
+    logOutput.println(F("Servern godkände inte kortet."));
     return false;
   }
 }
@@ -1516,7 +1664,7 @@ bool queryServerAndOpenIfValid(const String &uid, bool canWriteNow = false, bool
 // Snabb skrivning medan kortet fortfarande är aktivt
 bool writeCardNow(const String &input)
 {
-  Serial.println("→ Försöker skriva direkt till kortet (medan det ligger kvar)");
+  logOutput.println("→ Försöker skriva direkt till kortet (medan det ligger kvar)");
 
   // Samma parsing som tidigare (använd den fungerande versionen)
   String parts[5];
@@ -1556,12 +1704,12 @@ bool writeCardNow(const String &input)
 
   if (status == MFRC522_I2C::STATUS_OK)
   {
-    Serial.println(F("✅ Kortet uppdaterades direkt!"));
+    logOutput.println(F("✅ Kortet uppdaterades direkt!"));
     return true;
   }
   else
   {
-    Serial.printf("❌ Write fel: %s\n", mfrc522.GetStatusCodeName(status));
+    logOutput.printf("❌ Write fel: %s\n", mfrc522.GetStatusCodeName(status));
     return false;
   }
 }
@@ -1577,15 +1725,15 @@ bool wakeUpCard()
   Wire.requestFrom(MFRC522_ADDR, 1);
   if (Wire.available() && Wire.read() == STATUS_CARD_DETECTED)
   {
-    Serial.println(F("✅ Kort väckt via CMD_WAKEUP"));
+    logOutput.println(F("✅ Kort väckt via CMD_WAKEUP"));
     return true;
   }
 
   // Försök 2: Standard bibliotek-metod (ofta mer stabil)
-  Serial.println(F("Wakeup misslyckades → försöker med PICC_IsNewCardPresent"));
+  logOutput.println(F("Wakeup misslyckades → försöker med PICC_IsNewCardPresent"));
   if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial())
   {
-    Serial.println(F("✅ Kort hittat via bibliotek"));
+    logOutput.println(F("✅ Kort hittat via bibliotek"));
     return true;
   }
 
@@ -1593,17 +1741,17 @@ bool wakeUpCard()
   byte ver = mfrc522.PCD_ReadRegister(mfrc522.VersionReg);
   if (ver != 0x00 && ver != 0xFF)
   {
-    Serial.println(F("✅ MFRC522 svarar fortfarande"));
+    logOutput.println(F("✅ MFRC522 svarar fortfarande"));
     return true;
   }
 
-  Serial.println(F("❌ Kunde inte väcka kortet efter 3 försök"));
+  logOutput.println(F("❌ Kunde inte väcka kortet efter 3 försök"));
   return false;
 }
 
 void writeCardDataCardPresent(String input)
 {
-  Serial.println("→ Raw input från server: " + input);
+  logOutput.println("→ Raw input från server: " + input);
 
   // Dela upp på kommatecken först (innan vi tar bort mellanslag)
   String parts[5];
@@ -1621,7 +1769,7 @@ void writeCardDataCardPresent(String input)
 
   if (partIndex < 4)
   {
-    Serial.println(F("❌ Fel format från servern"));
+    logOutput.println(F("❌ Fel format från servern"));
     return;
   }
 
@@ -1655,8 +1803,8 @@ void writeCardDataCardPresent(String input)
   long orderId = orderStr.toInt();
   long siteId = siteStr.toInt();
 
-  Serial.printf("Server-write: %04d-%02d-%02d %02d:%02d → %04d-%02d-%02d %02d:%02d | Order:%ld | Site:%ld\n",
-                y1, m1, d1, h1, min1, y2, m2, d2, h2, min2, orderId, siteId);
+  logOutput.printf("Server-write: %04d-%02d-%02d %02d:%02d → %04d-%02d-%02d %02d:%02d | Order:%ld | Site:%ld\n",
+                   y1, m1, d1, h1, min1, y2, m2, d2, h2, min2, orderId, siteId);
 
   // === Packa till kort ===
   byte buf[16] = {0};
@@ -1674,7 +1822,7 @@ void writeCardDataCardPresent(String input)
   memcpy(buf + 14, &siteId, 2);
 
   // Skriv till kort
-  Serial.println(F("Försöker skriva till kort..."));
+  logOutput.println(F("Försöker skriva till kort..."));
   bool success = false;
   unsigned long timeout = millis() + 10000;
 
@@ -1688,17 +1836,17 @@ void writeCardDataCardPresent(String input)
 
         if (status == MFRC522_I2C::STATUS_OK)
         {
-          Serial.println(F("✅ Kortet uppdaterades från server!"));
+          logOutput.println(F("✅ Kortet uppdaterades från server!"));
           success = true;
         }
         else
         {
-          Serial.printf("❌ Write fel: %s\n", mfrc522.GetStatusCodeName(status));
+          logOutput.printf("❌ Write fel: %s\n", mfrc522.GetStatusCodeName(status));
         }
       }
       else
       {
-        Serial.println(F("❌ Autentisering misslyckades"));
+        logOutput.println(F("❌ Autentisering misslyckades"));
       }
 
       mfrc522.PICC_HaltA();
@@ -1709,7 +1857,7 @@ void writeCardDataCardPresent(String input)
   }
 
   if (!success)
-    Serial.println(F("❌ Timeout vid skrivning"));
+    logOutput.println(F("❌ Timeout vid skrivning"));
 }
 
 void printSettings(Print &out)
@@ -1761,7 +1909,7 @@ void processSerialCommand()
   if (input.length() == 0)
     return;
 
-  Serial.println("→ " + input);
+  logOutput.println("→ " + input);
 
   int spaceIndex = input.indexOf(' ');
   String command = (spaceIndex != -1 ? input.substring(0, spaceIndex) : input);
@@ -1778,7 +1926,7 @@ void processSerialCommand()
     // int p2 = params.indexOf(',', p1 + 1);
     if (p1 == -1)
     {
-      Serial.println(F("Använd: relay <red/green>,<on/off>"));
+      logOutput.println(F("Använd: relay <red/green>,<on/off>"));
       return;
     }
     String r = params.substring(0, p1);
@@ -1801,12 +1949,12 @@ void processSerialCommand()
       prefs.putLong("gateId", gateId);
       configVersion = 0;
       prefs.putInt("configVersion", configVersion);
-      Serial.printf("Gate ID uppdaterat till: %ld\n", gateId);
-      Serial.printf("Config hämtas vid nästa omstart från: %s%ld/config\n", GATE_CONFIG_BASE_URL.c_str(), gateId);
+      logOutput.printf("Gate ID uppdaterat till: %ld\n", gateId);
+      logOutput.printf("Config hämtas vid nästa omstart från: %s%ld/config\n", GATE_CONFIG_BASE_URL.c_str(), gateId);
     }
     else
     {
-      Serial.println(F("Använd: setgatenr <GateNr>"));
+      logOutput.println(F("Använd: setgatenr <GateNr>"));
     }
   }
   else if (command == "setport")
@@ -1816,7 +1964,7 @@ void processSerialCommand()
     {
       portSiteId = id;
       prefs.putLong("portSiteId", id);
-      Serial.printf("portSiteId = %ld\n", id);
+      logOutput.printf("portSiteId = %ld\n", id);
     }
   }
   else if (command == "setwifi")
@@ -1824,7 +1972,7 @@ void processSerialCommand()
     int c = params.indexOf(',');
     if (c == -1)
     {
-      Serial.println(F("Använd: setwifi <SSID>,<lösenord>"));
+      logOutput.println(F("Använd: setwifi <SSID>,<lösenord>"));
       return;
     }
     String s = params.substring(0, c);
@@ -1833,7 +1981,7 @@ void processSerialCommand()
     strncpy(wifiPass, p.c_str(), sizeof(wifiPass) - 1);
     prefs.putString("ssid", wifiSsid);
     prefs.putString("pass", wifiPass);
-    Serial.println(F("WiFi sparat → startar om..."));
+    logOutput.println(F("WiFi sparat → startar om..."));
     delay(1000);
     ESP.restart();
   }
@@ -1843,11 +1991,11 @@ void processSerialCommand()
     {
       strncpy(baseUrl, params.c_str(), sizeof(baseUrl) - 1);
       prefs.putString("baseUrl", baseUrl);
-      Serial.printf("baseUrl uppdaterad till: %s\n", baseUrl);
+      logOutput.printf("baseUrl uppdaterad till: %s\n", baseUrl);
     }
     else
     {
-      Serial.println(F("Använd: setbaseurl <url>"));
+      logOutput.println(F("Använd: setbaseurl <url>"));
     }
   }
   else if (command == "synctime")
@@ -1857,7 +2005,7 @@ void processSerialCommand()
   }
   else if (command == "ota")
   {
-    Serial.println(F("Manuell OTA-kontroll..."));
+    logOutput.println(F("Manuell OTA-kontroll..."));
     checkForOtaUpdate();
   }
   else if (command == "setdate")
@@ -1869,11 +2017,11 @@ void processSerialCommand()
       tm.tm_mon -= 1;
       currentTime = mktime(&tm);
       prefs.putLong("time", currentTime);
-      Serial.printf("Datum och tid satt manuellt till: %s", ctime(&currentTime));
+      logOutput.printf("Datum och tid satt manuellt till: %s", ctime(&currentTime));
     }
     else
     {
-      Serial.println(F("Fel format: setdate YYYY-MM-DD HH:MM"));
+      logOutput.println(F("Fel format: setdate YYYY-MM-DD HH:MM"));
     }
   }
   else if (command == "getcardinfo")
@@ -1881,45 +2029,45 @@ void processSerialCommand()
     int c1 = params.indexOf(',');
     if (c1 == -1)
     {
-      Serial.println(F("Använd: getcardinfo CardID,SiteID"));
+      logOutput.println(F("Använd: getcardinfo CardID,SiteID"));
       return;
     }
     String cardId = params.substring(0, c1);
     long testSiteId = params.substring(c1 + 1).toInt();
-    Serial.printf("Frågar servern om kort %s (SiteID %ld)...\n", cardId.c_str(), testSiteId);
+    logOutput.printf("Frågar servern om kort %s (SiteID %ld)...\n", cardId.c_str(), testSiteId);
     queryServerAndOpenIfValid(cardId);
   }
   else if (command == "testwifi")
   {
-    Serial.println(F("\n=== Testar WiFi-anslutning ==="));
-    Serial.printf("SSID: %s\n", wifiSsid);
-    Serial.printf("Lösenord: %s\n", wifiPass);
+    logOutput.println(F("\n=== Testar WiFi-anslutning ==="));
+    logOutput.printf("SSID: %s\n", wifiSsid);
+    logOutput.printf("Lösenord: %s\n", wifiPass);
     WiFi.disconnect();
     delay(500);
     connectWiFi();
     if (WiFi.status() == WL_CONNECTED)
     {
-      Serial.println(F("WiFi fungerar!"));
+      logOutput.println(F("WiFi fungerar!"));
       syncTimeFromNtp();
       lastSyncMillis = millis();
     }
     else
     {
-      Serial.println(F("WiFi fungerar INTE – kolla SSID/lösen eller räckvidd"));
-      Serial.println(F("Kräver 2.4Gz"));
+      logOutput.println(F("WiFi fungerar INTE – kolla SSID/lösen eller räckvidd"));
+      logOutput.println(F("Kräver 2.4Gz"));
     }
   }
   else if (command == "scanwifi")
   {
-    Serial.println("Skannar WiFi...");
+    logOutput.println("Skannar WiFi...");
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     delay(100);
     int n = WiFi.scanNetworks();
-    Serial.printf("Hittade %d nätverk:\n", n);
+    logOutput.printf("Hittade %d nätverk:\n", n);
     for (int i = 0; i < n; i++)
     {
-      Serial.printf(
+      logOutput.printf(
           "%2d: %-32s RSSI:%4d  CH:%2d\n",
           i,
           WiFi.SSID(i).c_str(),
@@ -1933,11 +2081,11 @@ void processSerialCommand()
     {
       database = params;
       prefs.putString("database", params);
-      Serial.println("Database uppdaterad till: " + params);
+      logOutput.println("Database uppdaterad till: " + params);
     }
     else
     {
-      Serial.println(F("Använd: setdatabase <nytt namn>"));
+      logOutput.println(F("Använd: setdatabase <nytt namn>"));
     }
     // Programversion – skrivskyddad.
   }
@@ -1958,11 +2106,11 @@ void processSerialCommand()
     {
       relayOnDuration = newDur;
       prefs.putULong("relayOnDuration", newDur);
-      Serial.printf("Relä-duration uppdaterad till: %lu ms\n", newDur);
+      logOutput.printf("Relä-duration uppdaterad till: %lu ms\n", newDur);
     }
     else
     {
-      Serial.println(F("Använd: setreldur <nytt värde i ms>"));
+      logOutput.println(F("Använd: setreldur <nytt värde i ms>"));
     }
   }
   else if (command == "setauthtime")
@@ -1974,13 +2122,13 @@ void processSerialCommand()
       RFID_AUTH_TIMEOUT = newTimeout;
       prefs.putULong("rfidAuthTimeout", RFID_AUTH_TIMEOUT);
 
-      Serial.printf(
+      logOutput.printf(
           "RFID timeout uppdaterad till: %lu ms\n",
           RFID_AUTH_TIMEOUT);
     }
     else
     {
-      Serial.println(
+      logOutput.println(
           "Använd: setauthtime <millisekunder> (1-60000)");
     }
   }
@@ -1999,14 +2147,14 @@ void processSerialCommand()
     if (UseIRGate)
     {
       updateIrInput();
-      Serial.println(F("IR gate aktiverad."));
+      logOutput.println(F("IR gate aktiverad."));
     }
     else
     {
-      Serial.println(F("IR gate avstängd – tidigare RFID-beteende används."));
+      logOutput.println(F("IR gate avstängd – tidigare RFID-beteende används."));
     }
 
-    Serial.printf("IR gate finns i systemet: %d\n", UseIRGate);
+    logOutput.printf("IR gate finns i systemet: %d\n", UseIRGate);
   }
   else if (command == "getcounts")
   {
@@ -2019,48 +2167,48 @@ void processSerialCommand()
       greenPassageCount = 0;
       redPassageCount = 0;
       savePassageCounts();
-      Serial.println(F("Passageräknarna har nollställts."));
+      logOutput.println(F("Passageräknarna har nollställts."));
       printPassageCounts();
     }
     else
     {
-      Serial.println(F("För att nollställa båda räknarna, skriv: clearcounts confirm"));
+      logOutput.println(F("För att nollställa båda räknarna, skriv: clearcounts confirm"));
     }
   }
   else if (command == "getsettings")
   {
-    Serial.println(F("\n=== Nuvarande inställningar ==="));
-    Serial.printf("Tid           : %s", ctime(&currentTime));
-    Serial.printf("Gate ID       : %ld\n", gateId);
-    Serial.printf("Site ID       : %ld\n", portSiteId);
-    Serial.printf("Config ver.   : %d\n", configVersion);
-    Serial.printf("GateState     : %s (%d)\n", gateStateName(gateState), (int)gateState);
-    Serial.printf("WiFi          : %s\n", wifiSsid);
-    Serial.printf("Password      : %s\n", wifiPass);
-    Serial.printf("WiFi dB       : %s\n", wifidB);
-    Serial.printf("Local IP      : %s\n", IP.c_str());
+    logOutput.println(F("\n=== Nuvarande inställningar ==="));
+    logOutput.printf("Tid           : %s", ctime(&currentTime));
+    logOutput.printf("Gate ID       : %ld\n", gateId);
+    logOutput.printf("Site ID       : %ld\n", portSiteId);
+    logOutput.printf("Config ver.   : %d\n", configVersion);
+    logOutput.printf("GateState     : %s (%d)\n", gateStateName(gateState), (int)gateState);
+    logOutput.printf("WiFi          : %s\n", wifiSsid);
+    logOutput.printf("Password      : %s\n", wifiPass);
+    logOutput.printf("WiFi dB       : %s\n", wifidB);
+    logOutput.printf("Local IP      : %s\n", IP.c_str());
 
-    Serial.printf("Server        : %s\n", baseUrl);
-    Serial.printf("Config URL    : %s%ld/config\n", GATE_CONFIG_BASE_URL.c_str(), gateId);
-    Serial.printf("Database      : %s\n", database.c_str());
-    Serial.printf("Led Duration  : %lu\n", relayOnDuration);
-    Serial.printf("RFID timeout  : %lu\n", RFID_AUTH_TIMEOUT);
-    Serial.printf("IR debounce   : %lu\n", IR_DEBOUNCE_MS);
-    Serial.printf("Invalid red   : %lu\n", INVALID_CARD_RED_DURATION);
-    Serial.printf("Red post      : %lu\n", RED_POST_PASSAGE_DURATION);
-    Serial.printf("IR rearm      : %lu\n", IR_REARM_DELAY_MS);
-    Serial.printf("Version       : %d\n", programVersion);
-    Serial.printf("configVersion : %d\n", configVersion);
-    Serial.printf("IR exists     : %d\n", UseIRGate);
-    Serial.printf("Green passages: %lu\n", (unsigned long)greenPassageCount);
-    Serial.printf("Red passages  : %lu\n", (unsigned long)redPassageCount);
-    Serial.printf("Green LED pin : %d\n", PIN_LED_GREEN);
-    Serial.printf("Blue LED pin  : %d\n", PIN_LED_BLUE);
-    Serial.printf("External stat : %s\n",
-                  externalStatus == EXTERNAL_NO_WIFI ? "NO_WIFI" : externalStatus == EXTERNAL_WIFI_ONLY ? "WIFI_ONLY"
-                                                               : externalStatus == EXTERNAL_SERVER_OK   ? "SERVER_OK"
-                                                                                                        : "CONNECTING");
-    Serial.println(F("============================\n"));
+    logOutput.printf("Server        : %s\n", baseUrl);
+    logOutput.printf("Config URL    : %s%ld/config\n", GATE_CONFIG_BASE_URL.c_str(), gateId);
+    logOutput.printf("Database      : %s\n", database.c_str());
+    logOutput.printf("Led Duration  : %lu\n", relayOnDuration);
+    logOutput.printf("RFID timeout  : %lu\n", RFID_AUTH_TIMEOUT);
+    logOutput.printf("IR debounce   : %lu\n", IR_DEBOUNCE_MS);
+    logOutput.printf("Invalid red   : %lu\n", INVALID_CARD_RED_DURATION);
+    logOutput.printf("Red post      : %lu\n", RED_POST_PASSAGE_DURATION);
+    logOutput.printf("IR rearm      : %lu\n", IR_REARM_DELAY_MS);
+    logOutput.printf("Version       : %d\n", programVersion);
+    logOutput.printf("configVersion : %d\n", configVersion);
+    logOutput.printf("IR exists     : %d\n", UseIRGate);
+    logOutput.printf("Green passages: %lu\n", (unsigned long)greenPassageCount);
+    logOutput.printf("Red passages  : %lu\n", (unsigned long)redPassageCount);
+    logOutput.printf("Green LED pin : %d\n", PIN_LED_GREEN);
+    logOutput.printf("Blue LED pin  : %d\n", PIN_LED_BLUE);
+    logOutput.printf("External stat : %s\n",
+                     externalStatus == EXTERNAL_NO_WIFI ? "NO_WIFI" : externalStatus == EXTERNAL_WIFI_ONLY ? "WIFI_ONLY"
+                                                                  : externalStatus == EXTERNAL_SERVER_OK   ? "SERVER_OK"
+                                                                                                           : "CONNECTING");
+    logOutput.println(F("============================\n"));
   }
   else
     printHelp();
@@ -2083,7 +2231,7 @@ void processTcpClient()
       tcpAuthenticated = false;
       tcpInputBuffer = "";
 
-      Serial.println(F("TCP-klient ansluten."));
+      logOutput.println(F("TCP-klient ansluten."));
       tcpClient.println("SmartGate TCP - skicka AUTH <token>");
     }
   }
@@ -2134,7 +2282,7 @@ void processTcpClient()
       {
         tcpAuthenticated = true;
         tcpClient.println("OK AUTHENTICATED");
-        Serial.println(F("TCP-klient autentiserad."));
+        logOutput.println(F("TCP-klient autentiserad."));
       }
       else
       {
@@ -2142,7 +2290,7 @@ void processTcpClient()
         tcpClient.flush();
         tcpClient.stop();
         tcpAuthenticated = false;
-        Serial.println(F("TCP-autentisering misslyckades."));
+        logOutput.println(F("TCP-autentisering misslyckades."));
         return;
       }
 
@@ -2161,7 +2309,7 @@ void processTcpClient()
     command.toLowerCase();
     params.trim();
 
-    Serial.println("TCP kommando: " + command);
+    logOutput.println("TCP kommando: " + command);
 
     // Lokal OTA: OTA_BEGIN <storlek> <md5>
     if (command == "ota_begin")
@@ -2213,7 +2361,7 @@ void processTcpClient()
         return;
       }
 
-      Serial.printf(
+      logOutput.printf(
           "Lokal OTA begärd, storlek: %lu bytes\n",
           parsedSize);
 
@@ -2249,7 +2397,7 @@ void processTcpClient()
         prefs.putInt("configVersion", configVersion);
 
         tcpClient.printf("Gate ID uppdaterat till: %ld\n", gateId);
-        Serial.printf("Gate ID uppdaterat till: %ld\n", gateId);
+        logOutput.printf("Gate ID uppdaterat till: %ld\n", gateId);
       }
       else
       {
@@ -2422,7 +2570,7 @@ void processTcpClient()
       tcpClient.println("WiFi sparat. SmartGate startar om.");
       tcpClient.flush();
 
-      Serial.println(F("Wi-Fi-inställningar uppdaterade via TCP."));
+      logOutput.println(F("Wi-Fi-inställningar uppdaterade via TCP."));
       delay(1000);
       ESP.restart();
     }
@@ -2542,7 +2690,7 @@ bool receiveLocalOta(size_t imageSize, const String &md5)
   tcpClient.println("OK OTA");
   tcpClient.flush();
 
-  Serial.println(
+  logOutput.println(
       F("Lokal OTA klar. ESP32 startar om."));
 
   delay(500);
@@ -2554,7 +2702,7 @@ bool receiveLocalOta(size_t imageSize, const String &md5)
 
 void printHelp()
 {
-  Serial.println(F(
+  logOutput.println(F(
       "\n"
       "╔══════════════════════════════════════════════════════════╗\n"
       "║              SKIBAR RFID GATE – HJÄLP                    ║\n"
@@ -2669,8 +2817,8 @@ void printHelp()
 
 void eraseCard()
 {
-  Serial.println(F("\n=== Raderar kortet ==="));
-  Serial.println(F("Håll kortet mot läsaren inom 10 sekunder..."));
+  logOutput.println(F("\n=== Raderar kortet ==="));
+  logOutput.println(F("Håll kortet mot läsaren inom 10 sekunder..."));
 
   unsigned long deadline = millis() + 10000;
   bool cardFound = false;
@@ -2680,11 +2828,11 @@ void eraseCard()
     if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial())
     {
       cardFound = true;
-      Serial.printf("UID: %s\n", getCardUid().c_str());
+      logOutput.printf("UID: %s\n", getCardUid().c_str());
 
       if (!authenticateCard())
       {
-        Serial.println(F("❌ Autentisering misslyckades"));
+        logOutput.println(F("❌ Autentisering misslyckades"));
         break;
       }
 
@@ -2696,11 +2844,11 @@ void eraseCard()
 
       if (status == MFRC522_I2C::STATUS_OK)
       {
-        Serial.println(F("✅ Kortet är nu raderat (block 4 nollställt)"));
+        logOutput.println(F("✅ Kortet är nu raderat (block 4 nollställt)"));
       }
       else
       {
-        Serial.printf("❌ Fel vid radering: %s\n", mfrc522.GetStatusCodeName(status));
+        logOutput.printf("❌ Fel vid radering: %s\n", mfrc522.GetStatusCodeName(status));
       }
 
       mfrc522.PICC_HaltA();
@@ -2716,7 +2864,7 @@ void eraseCard()
 
   if (!cardFound)
   {
-    Serial.println(F("❌ Ingen kort hittades inom 10 sekunder"));
+    logOutput.println(F("❌ Ingen kort hittades inom 10 sekunder"));
   }
 }
 
@@ -2724,7 +2872,7 @@ void checkForOtaUpdate()
 {
   if (WiFi.status() != WL_CONNECTED)
   {
-    Serial.println(F("OTA: Ingen WiFi-anslutning."));
+    logOutput.println(F("OTA: Ingen WiFi-anslutning."));
     return;
   }
 
@@ -2736,7 +2884,7 @@ void checkForOtaUpdate()
 
   if (httpCode != HTTP_CODE_OK)
   {
-    Serial.printf("OTA: Kunde inte hämta versionsfil. HTTP: %d\n", httpCode);
+    logOutput.printf("OTA: Kunde inte hämta versionsfil. HTTP: %d\n", httpCode);
     http.end();
     return;
   }
@@ -2748,26 +2896,26 @@ void checkForOtaUpdate()
 
   int latest = latestVersion.toInt();
 
-  Serial.printf("Installerad version: %d\n", programVersion);
-  Serial.printf("Tillgänglig version: %d\n", latest);
+  logOutput.printf("Installerad version: %d\n", programVersion);
+  logOutput.printf("Tillgänglig version: %d\n", latest);
 
   if (latest <= programVersion)
   {
-    Serial.println(F("OTA: Ingen ny version tillgänglig."));
+    logOutput.println(F("OTA: Ingen ny version tillgänglig."));
     return;
   }
 
-  Serial.println(F("OTA: Ny version finns. Startar uppdatering..."));
+  logOutput.println(F("OTA: Ny version finns. Startar uppdatering..."));
 
   if (performOtaUpdate())
   {
-    Serial.println(F("OTA: Uppdatering klar. Startar om ESP32..."));
+    logOutput.println(F("OTA: Uppdatering klar. Startar om ESP32..."));
     delay(1500);
     ESP.restart();
   }
   else
   {
-    Serial.println(F("OTA: Uppdateringen misslyckades."));
+    logOutput.println(F("OTA: Uppdateringen misslyckades."));
   }
 }
 
@@ -2818,11 +2966,27 @@ bool performOtaUpdate()
   return true;
 }
 
+void logPrint(const String &message)
+{
+  logOutput.print(message);
+
+  if (tcpAuthenticated && tcpClient.connected())
+  {
+    tcpClient.print(message);
+  }
+}
+
+void logPrintln(const String &message)
+{
+  logPrint(message + "\r\n");
+}
+
 void loop()
 {
   unsigned long now = millis();
 
   maintainWiFiConnection();
+  processDiscoveryUdp();
 
   updateStatusLeds();
   updateLocalTime();
@@ -2837,7 +3001,7 @@ void loop()
   struct tm *ti = localtime(&currentTime);
   if (ti && ti->tm_hour == 3 && ti->tm_mday != lastOtaCheckDay)
   {
-    Serial.println(F("03:00 – OTA-kontroll"));
+    logOutput.println(F("03:00 – OTA-kontroll"));
     checkForOtaUpdate();
     lastOtaCheckDay = ti->tm_mday;
   }
@@ -2893,13 +3057,13 @@ void loop()
   if (mfrc522.PICC_IsNewCardPresent() && mfrc522.PICC_ReadCardSerial())
   {
     String uid = getCardUid();
-    Serial.printf("\nKort detekterat: %s\n", uid.c_str());
+    logOutput.printf("\nKort detekterat: %s\n", uid.c_str());
 
     // Under en pågående passage ska ett nytt kort inte kunna växla
     // lampfärgen mitt under personen som redan passerar.
     if (UseIRGate && (gateState == GATE_GREEN_PASSING || gateState == GATE_RED_PASSING))
     {
-      Serial.println(F("Passage pågår → nytt RFID ignoreras till passagen är klar."));
+      logOutput.println(F("Passage pågår → nytt RFID ignoreras till passagen är klar."));
       mfrc522.PICC_HaltA();
       mfrc522.PCD_StopCrypto1();
       return;
@@ -2918,8 +3082,8 @@ void loop()
 
       if (locallyValid)
       {
-        Serial.printf("Kort giltigt lokalt → GODKÄNT! (idag: %s, SiteID: %ld)\n",
-                      todayStr, portSiteId);
+        logOutput.printf("Kort giltigt lokalt → GODKÄNT! (idag: %s, SiteID: %ld)\n",
+                         todayStr, portSiteId);
 
         if (UseIRGate)
         {
@@ -2934,21 +3098,21 @@ void loop()
       }
       else
       {
-        Serial.printf("Kort ogiltigt lokalt → frågar servern...\n");
-        Serial.printf("  → Dagens datum: %s\n", todayStr);
-        Serial.printf("  → PortSiteID på grinden: %ld\n", portSiteId);
-        Serial.printf("  → Kort giltigt: %s → %s | SiteID: %ld\n",
-                      formatTimeDebug(from).c_str(),
-                      formatTimeDebug(to).c_str(),
-                      siteId);
+        logOutput.printf("Kort ogiltigt lokalt → frågar servern...\n");
+        logOutput.printf("  → Dagens datum: %s\n", todayStr);
+        logOutput.printf("  → PortSiteID på grinden: %ld\n", portSiteId);
+        logOutput.printf("  → Kort giltigt: %s → %s | SiteID: %ld\n",
+                         formatTimeDebug(from).c_str(),
+                         formatTimeDebug(to).c_str(),
+                         siteId);
 
         if (from > currentTime)
-          Serial.println("  → FEL: Kortet börjar gälla i framtiden!");
+          logOutput.println("  → FEL: Kortet börjar gälla i framtiden!");
         if (to < currentTime)
-          Serial.println("  → FEL: Kortet har gått ut!");
+          logOutput.println("  → FEL: Kortet har gått ut!");
         if (siteId != portSiteId)
         {
-          Serial.printf("  → FEL: SiteID stämmer inte (%ld vs %ld)\n", siteId, portSiteId);
+          logOutput.printf("  → FEL: SiteID stämmer inte (%ld vs %ld)\n", siteId, portSiteId);
         }
 
         const bool serverAccepted = queryServerAndOpenIfValid(uid, true, UseIRGate);
@@ -2970,7 +3134,7 @@ void loop()
     }
     else
     {
-      Serial.println(F("Kunde inte läsa kortdata → RFID ej godkänt"));
+      logOutput.println(F("Kunde inte läsa kortdata → RFID ej godkänt"));
 
       cancelPassageAuthorization("RFID kunde inte verifieras");
 
