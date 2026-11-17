@@ -2114,23 +2114,46 @@ void processSerialCommand()
       logOutput.println(F("Använd: setreldur <nytt värde i ms>"));
     }
   }
-  else if (command == "setauthtime")
+  else if (command == "setauthtime" || command == "setirdebounce" ||
+           command == "setinvalidred" || command == "setredpost" ||
+           command == "setirrearm")
   {
-    unsigned long newTimeout = params.toInt();
+    char *endPtr = nullptr;
+    unsigned long value = strtoul(params.c_str(), &endPtr, 10);
 
-    if (newTimeout > 0 && newTimeout <= 60000)
+    if (params.length() == 0 || endPtr == params.c_str() || *endPtr != '\0' || value == 0 || value > 60000UL)
     {
-      RFID_AUTH_TIMEOUT = newTimeout;
-      prefs.putULong("rfidAuthTimeout", RFID_AUTH_TIMEOUT);
-
-      logOutput.printf(
-          "RFID timeout uppdaterad till: %lu ms\n",
-          RFID_AUTH_TIMEOUT);
+      logOutput.println("Använd ett heltal mellan 1 och 60000 ms.");
     }
-    else
+    else if (command == "setauthtime")
     {
-      logOutput.println(
-          "Använd: setauthtime <millisekunder> (1-60000)");
+      RFID_AUTH_TIMEOUT = value;
+      prefs.putULong("rfidAuthTimeout", value);
+      logOutput.printf("RFID timeout uppdaterad till: %lu ms\n", value);
+    }
+    else if (command == "setirdebounce")
+    {
+      IR_DEBOUNCE_MS = value;
+      prefs.putULong("irDebounceMs", value);
+      logOutput.printf("IR debounce uppdaterad till: %lu ms\n", value);
+    }
+    else if (command == "setinvalidred")
+    {
+      INVALID_CARD_RED_DURATION = value;
+      prefs.putULong("invalidRedMs", value);
+      logOutput.printf("Invalid red uppdaterad till: %lu ms\n", value);
+    }
+    else if (command == "setredpost")
+    {
+      RED_POST_PASSAGE_DURATION = value;
+      prefs.putULong("redPostMs", value);
+      logOutput.printf("Red post uppdaterad till: %lu ms\n", value);
+    }
+    else if (command == "setirrearm")
+    {
+      IR_REARM_DELAY_MS = value;
+      prefs.putULong("irRearmMs", value);
+      logOutput.printf("IR rearm uppdaterad till: %lu ms\n", value);
     }
   }
   else if (command == "irexist")
@@ -2372,18 +2395,12 @@ void processTcpClient()
       return;
     }
     // Befintliga kommandon fortsätter här.
-    if (command == "getsettings")
-    {
-      printSettings(tcpClient);
-      tcpClient.flush();
-    }
     // Läs inställningar.
     if (command == "getsettings")
     {
       printSettings(tcpClient);
       tcpClient.flush();
     }
-
     // Gate ID.
     else if (command == "setgatenr")
     {
@@ -2483,6 +2500,50 @@ void processTcpClient()
       {
         tcpClient.println("ERR Ogiltig reläduration");
       }
+    }
+
+    // Tidsinställningar för passage och RFID.
+    else if (command == "setauthtime" || command == "setirdebounce" ||
+             command == "setinvalidred" || command == "setredpost" ||
+             command == "setirrearm")
+    {
+      char *endPtr = nullptr;
+      unsigned long value = strtoul(params.c_str(), &endPtr, 10);
+      if (params.length() == 0 || endPtr == params.c_str() || *endPtr != '\0' || value == 0 || value > 60000UL)
+      {
+        tcpClient.println("ERR Värdet måste vara ett heltal mellan 1 och 60000 ms");
+      }
+      else if (command == "setauthtime")
+      {
+        RFID_AUTH_TIMEOUT = value;
+        prefs.putULong("rfidAuthTimeout", value);
+        tcpClient.printf("RFID timeout uppdaterad till: %lu ms\n", value);
+      }
+      else if (command == "setirdebounce")
+      {
+        IR_DEBOUNCE_MS = value;
+        prefs.putULong("irDebounceMs", value);
+        tcpClient.printf("IR debounce uppdaterad till: %lu ms\n", value);
+      }
+      else if (command == "setinvalidred")
+      {
+        INVALID_CARD_RED_DURATION = value;
+        prefs.putULong("invalidRedMs", value);
+        tcpClient.printf("Invalid red uppdaterad till: %lu ms\n", value);
+      }
+      else if (command == "setredpost")
+      {
+        RED_POST_PASSAGE_DURATION = value;
+        prefs.putULong("redPostMs", value);
+        tcpClient.printf("Red post uppdaterad till: %lu ms\n", value);
+      }
+      else if (command == "setirrearm")
+      {
+        IR_REARM_DELAY_MS = value;
+        prefs.putULong("irRearmMs", value);
+        tcpClient.printf("IR rearm uppdaterad till: %lu ms\n", value);
+      }
+      tcpClient.flush();
     }
 
     // IR-inställning.

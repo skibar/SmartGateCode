@@ -68,6 +68,7 @@ unsigned long IR_DEBOUNCE_MS = 50UL;              // Filter för IR-signalen
 unsigned long INVALID_CARD_RED_DURATION = 3500UL; // Rött efter ogiltigt kort
 unsigned long RED_POST_PASSAGE_DURATION = 3000UL; // Rött efter att obehörig passerat
 unsigned long IR_REARM_DELAY_MS = 1000UL;         // Minst 1 s innan ny röd passage tillåts
+unsigned long relayOnDuration = 5000;
 
 bool passageAuthorized = false;
 unsigned long passageAuthorizedAt = 0;
@@ -108,6 +109,10 @@ void eraseCard();
 
 bool receiveLocalOta(size_t imageSize, const String &md5);
 // ------------------------------------------------------------
+const char* SETUP_AP_SSID = "SmartGate-Setup";
+const char* SETUP_AP_PASSWORD = "EttGemensamtLosenord";
+// ------------------------------------------------------------
+
 
 const char *gateStateName(GateState state)
 {
@@ -243,7 +248,7 @@ bool cardWriteMode = false;
 unsigned long lastSyncMillis = 0; // Ny variabel för senaste NTP-synk (i millis)
 
 String database = "SkibarV2";
-unsigned long relayOnDuration = 5000;
+
 bool UseIRGate = true; // Finns det en IR gate i systemet
 
 // ------------------------------------------------------------
